@@ -7,6 +7,10 @@ const { Hand } = require('pokersolver');
 const { createDeck, shuffleDeck } = require('./gameUtils');
 
 app.use(cors());
+app.get("/", (req, res) => {
+    res.send("♣️♥️ POKER SERVER IS RUNNING SUCCESSFULLY ♦️♠️");
+});
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
