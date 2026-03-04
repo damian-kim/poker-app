@@ -7,9 +7,7 @@ const { Hand } = require('pokersolver');
 const { createDeck, shuffleDeck } = require('./gameUtils');
 
 app.use(cors());
-app.get("/", (req, res) => {
-    res.send("♣️♥️ POKER SERVER IS RUNNING SUCCESSFULLY ♦️♠️");
-});
+app.get("/", (req, res) => res.send("♣️♥️ POKER SERVER IS RUNNING SUCCESSFULLY ♦️♠️"));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
@@ -32,7 +30,8 @@ let gameState = {
     nextHandBombPot: false, 
     bombPotAnnounce: "",
     winners: [], 
-    ledger: {}, 
+    ledger: {}, // Holds Financials AND Stats
+    streetRaiseCount: 0, // Tracks if a raise is a 2-bet, 3-bet, etc.
     settings: {
         sbAmount: 10,
         bbAmount: 20,
@@ -93,6 +92,10 @@ function checkEarlyWin() {
         const winner = active[0];
         winner.chips += gameState.pot;
         gameState.winners = [gameState.seats.indexOf(winner)];
+        
+        // Track Win Stat
+        if (gameState.ledger[winner.nickname]) gameState.ledger[winner.nickname].stats.handsWon++;
+
         endHand(`${winner.name} wins ${gameState.pot} (Everyone folded)`);
         return true;
     }
@@ -124,23 +127,20 @@ function handleShowdown() {
     let wonWith27 = false;
     gameState.winners = []; 
 
+    // Stat Tracking: Went to Showdown
+    active.forEach(p => {
+        if (gameState.ledger[p.nickname]) gameState.ledger[p.nickname].stats.showdownsSeen++;
+    });
+
     if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') {
         let pot1 = Math.floor(gameState.pot / 2);
         let pot2 = gameState.pot - pot1; 
         
-        const hands1 = active.map(p => {
-            let solved = solvePLO(formatCards(p.hand), board1);
-            solved.seatIndex = gameState.seats.indexOf(p);
-            return solved;
-        });
+        const hands1 = active.map(p => { let solved = solvePLO(formatCards(p.hand), board1); solved.seatIndex = gameState.seats.indexOf(p); return solved; });
         const winners1 = Hand.winners(hands1);
         const win1Amt = Math.floor(pot1 / winners1.length);
         
-        const hands2 = active.map(p => {
-            let solved = solvePLO(formatCards(p.hand), board2);
-            solved.seatIndex = gameState.seats.indexOf(p);
-            return solved;
-        });
+        const hands2 = active.map(p => { let solved = solvePLO(formatCards(p.hand), board2); solved.seatIndex = gameState.seats.indexOf(p); return solved; });
         const winners2 = Hand.winners(hands2);
         const win2Amt = Math.floor(pot2 / winners2.length);
 
@@ -161,12 +161,7 @@ function handleShowdown() {
         resultText = `Top: ${w1Names.join("&")} (${winners1[0].descr}) | Bottom: ${w2Names.join("&")} (${winners2[0].descr})`;
 
     } else {
-        const playerHands = active.map(p => {
-            const solved = Hand.solve([...board1, ...formatCards(p.hand)]);
-            solved.seatIndex = gameState.seats.indexOf(p);
-            return solved;
-        });
-
+        const playerHands = active.map(p => { const solved = Hand.solve([...board1, ...formatCards(p.hand)]); solved.seatIndex = gameState.seats.indexOf(p); return solved; });
         const winners = Hand.winners(playerHands);
         const winAmount = Math.floor(gameState.pot / winners.length);
         
@@ -178,16 +173,22 @@ function handleShowdown() {
             gameState.winners.push(w.seatIndex);
             
             const h = player.hand;
-            if (h.length === 2) {
-                const has2 = h[0].value === "2" || h[1].value === "2";
-                const has7 = h[0].value === "7" || h[1].value === "7";
-                const isOff = h[0].suit !== h[1].suit;
-                if (has2 && has7 && isOff) wonWith27 = true;
+            if (h.length === 2 && ((h[0].value === "2" || h[1].value === "2") && (h[0].value === "7" || h[1].value === "7") && h[0].suit !== h[1].suit)) {
+                wonWith27 = true;
             }
         });
 
         resultText = `${winnerNames.join(" & ")} wins with ${winners[0].descr}!`;
     }
+
+    // Stat Tracking: Won at Showdown & Total Hands Won
+    gameState.winners.forEach(seatIdx => {
+        const p = gameState.seats[seatIdx];
+        if (p && gameState.ledger[p.nickname]) {
+            gameState.ledger[p.nickname].stats.showdownsWon++;
+            gameState.ledger[p.nickname].stats.handsWon++;
+        }
+    });
 
     if (wonWith27 && gameState.settings.trigger27) {
         gameState.nextHandBombPot = true;
@@ -211,14 +212,10 @@ function fastForwardToShowdown() {
     let dealInterval = setInterval(() => {
         if (gameState.communityCards.length < 3) {
             gameState.communityCards.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
-            if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') {
-                gameState.communityCards2.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
-            }
+            if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') gameState.communityCards2.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
         } else if (gameState.communityCards.length < 5) {
             gameState.communityCards.push(gameState.deck.pop());
-            if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') {
-                gameState.communityCards2.push(gameState.deck.pop());
-            }
+            if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') gameState.communityCards2.push(gameState.deck.pop());
         } else {
             clearInterval(dealInterval);
             handleShowdown();
@@ -242,6 +239,7 @@ function nextPhase() {
 
     gameState.seats.forEach(p => { if (p) { p.currentBet = 0; p.hasActed = false; } });
     gameState.currentBet = 0;
+    gameState.streetRaiseCount = 0; // Reset raise tracker for the new street
     
     if (getPlayersWithChips().length <= 1 && getActivePlayers().length > 1) {
         fastForwardToShowdown();
@@ -251,9 +249,7 @@ function nextPhase() {
     if (gameState.phase === 'preflop') {
         gameState.phase = 'flop';
         gameState.communityCards.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
-        if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') {
-             gameState.communityCards2.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
-        }
+        if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') gameState.communityCards2.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
 
         if (gameState.settings.triggerMonotone) {
             const c = gameState.communityCards;
@@ -265,15 +261,11 @@ function nextPhase() {
     } else if (gameState.phase === 'flop') {
         gameState.phase = 'turn';
         gameState.communityCards.push(gameState.deck.pop());
-        if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') {
-            gameState.communityCards2.push(gameState.deck.pop());
-        }
+        if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') gameState.communityCards2.push(gameState.deck.pop());
     } else if (gameState.phase === 'turn') {
         gameState.phase = 'river';
         gameState.communityCards.push(gameState.deck.pop());
-        if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') {
-            gameState.communityCards2.push(gameState.deck.pop());
-        }
+        if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') gameState.communityCards2.push(gameState.deck.pop());
     } else if (gameState.phase === 'river') {
         handleShowdown();
         return; 
@@ -306,6 +298,7 @@ function startNextHand() {
     gameState.pot = 0;
     gameState.handResult = null;
     gameState.handsPlayed++;
+    gameState.streetRaiseCount = 0;
 
     if (gameState.settings.triggerOrbit > 0) {
         if (gameState.handsPlayed % (activePlayersCount * gameState.settings.triggerOrbit) === 0) {
@@ -326,12 +319,16 @@ function startNextHand() {
             p.hasActed = false;
             p.role = '';
             p.inHand = true; 
+            
+            // Hand-level Stat Trackers
+            p.hasVPIPed = false; 
+            p.hasPFR = false;
+            p.has3Bet = false;
+            if (gameState.ledger[p.nickname]) gameState.ledger[p.nickname].stats.handsDealt++;
         }
     });
 
-    do {
-        gameState.dealerSeat = (gameState.dealerSeat + 1) % MAX_SEATS;
-    } while (gameState.seats[gameState.dealerSeat] === null);
+    do { gameState.dealerSeat = (gameState.dealerSeat + 1) % MAX_SEATS; } while (gameState.seats[gameState.dealerSeat] === null);
 
     const count = gameState.seats.filter(s => s && s.inHand).length;
     let sbSeat = gameState.dealerSeat;
@@ -368,9 +365,7 @@ function startNextHand() {
         gameState.currentBet = 0;
         
         gameState.communityCards.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
-        if (gameState.settings.bombPotMode === 'plo') {
-            gameState.communityCards2.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
-        }
+        if (gameState.settings.bombPotMode === 'plo') gameState.communityCards2.push(gameState.deck.pop(), gameState.deck.pop(), gameState.deck.pop());
 
         gameState.turnSeat = gameState.dealerSeat;
         moveTurn(); 
@@ -402,7 +397,6 @@ function startNextHand() {
 io.on("connection", (socket) => {
     io.emit("game_update", gameState); 
 
-    // NO MORE OWNER RESTRICTIONS - ANYONE CAN CHANGE SETTINGS
     socket.on("update_settings", (newSettings) => {
         gameState.settings = { ...gameState.settings, ...newSettings };
         io.emit("game_update", gameState);
@@ -421,16 +415,17 @@ io.on("connection", (socket) => {
         const actualBuyIn = Math.max(gameState.settings.minBuyIn, Math.min(gameState.settings.maxBuyIn, buyIn));
         
         if (!gameState.ledger[nickname]) {
-            gameState.ledger[nickname] = { buyIn: 0, cashOut: 0 };
+            gameState.ledger[nickname] = { 
+                buyIn: 0, cashOut: 0, 
+                stats: { handsDealt: 0, vpipCount: 0, pfrCount: 0, threeBetCount: 0, handsWon: 0, showdownsSeen: 0, showdownsWon: 0 } 
+            };
         }
         gameState.ledger[nickname].buyIn += actualBuyIn;
 
         gameState.seats[seatIndex] = {
-            id: socket.id, 
-            nickname: nickname, 
-            name: nickname, 
-            chips: actualBuyIn,
-            hand: [], isFolded: true, currentBet: 0, hasActed: false, role: '', inHand: false 
+            id: socket.id, nickname: nickname, name: nickname, chips: actualBuyIn,
+            hand: [], isFolded: true, currentBet: 0, hasActed: false, role: '', inHand: false,
+            hasVPIPed: false, hasPFR: false, has3Bet: false
         };
 
         io.emit("game_update", gameState);
@@ -441,6 +436,10 @@ io.on("connection", (socket) => {
         const mySeatIndex = gameState.seats.findIndex(s => s && s.id === socket.id);
         if (mySeatIndex === -1 || gameState.turnSeat !== mySeatIndex) return;
         const player = gameState.seats[mySeatIndex];
+        const stats = gameState.ledger[player.nickname]?.stats;
+        
+        // Defines the "First Action" street (Preflop normally, Flop during Bomb Pots)
+        const isFirstStreet = (gameState.phase === 'preflop' && !gameState.isBombPot) || (gameState.phase === 'flop' && gameState.isBombPot);
 
         switch (action.type) {
             case 'fold': player.isFolded = true; player.hasActed = true; break;
@@ -449,21 +448,34 @@ io.on("connection", (socket) => {
                 const amtToCall = gameState.currentBet - player.currentBet;
                 const actCall = Math.min(player.chips, amtToCall);
                 player.chips -= actCall; player.currentBet += actCall; gameState.pot += actCall; player.hasActed = true;
+                
+                // Track VPIP (Calling preflop/first-street is putting money in voluntarily)
+                if (isFirstStreet && !player.hasVPIPed && stats) {
+                    player.hasVPIPed = true;
+                    stats.vpipCount++;
+                }
                 break;
             case 'raise':
                 let targetAmount = action.amount;
-                
                 if (gameState.isBombPot && gameState.settings.bombPotMode === 'plo') {
                     const toCall = gameState.currentBet - player.currentBet;
                     const maxPLO = gameState.pot + (2 * toCall) + player.currentBet;
                     targetAmount = Math.min(targetAmount, maxPLO);
                 }
-
                 const cost = targetAmount - player.currentBet;
                 const actCost = Math.min(player.chips, cost);
                 player.chips -= actCost; player.currentBet += actCost; gameState.pot += actCost;
                 gameState.currentBet = Math.max(gameState.currentBet, player.currentBet);
                 player.hasActed = true;
+                
+                // Track Stats 
+                if (isFirstStreet && stats) {
+                    if (!player.hasVPIPed) { player.hasVPIPed = true; stats.vpipCount++; }
+                    if (!player.hasPFR) { player.hasPFR = true; stats.pfrCount++; }
+                    if (gameState.streetRaiseCount > 0 && !player.has3Bet) { player.has3Bet = true; stats.threeBetCount++; }
+                    gameState.streetRaiseCount++;
+                }
+
                 gameState.seats.forEach(p => { if (p && p.inHand && p.id !== player.id) p.hasActed = false; });
                 break;
         }
@@ -477,10 +489,7 @@ io.on("connection", (socket) => {
         const seatIndex = gameState.seats.findIndex(s => s && s.id === socket.id);
         if (seatIndex !== -1) {
             const player = gameState.seats[seatIndex];
-            
-            if (gameState.ledger[player.nickname]) {
-                gameState.ledger[player.nickname].cashOut += player.chips;
-            }
+            if (gameState.ledger[player.nickname]) gameState.ledger[player.nickname].cashOut += player.chips;
 
             if (gameState.turnSeat === seatIndex && player.inHand && !player.isFolded && gameState.phase !== 'waiting') {
                 player.isFolded = true;
@@ -492,7 +501,6 @@ io.on("connection", (socket) => {
     });
 });
 
-// READY FOR PRODUCTION: Use process.env.PORT
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
     console.log(`♠️ POKER SERVER RUNNING ON PORT ${PORT}`);
